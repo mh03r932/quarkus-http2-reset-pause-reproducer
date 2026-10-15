@@ -125,7 +125,12 @@ back onto the request's context closes it, and the 1 MB upload still completes:
 if (((ConnectionBase) request.connection()).channel().eventLoop().inEventLoop()) {
     resumeIfNotEnded();
 } else {
-    contextExecutor.execute(this::resumeIfNotEnded);
+    contextExecutor.execute(new Runnable() {
+        @Override
+        public void run() {
+            resumeIfNotEnded();
+        }
+    });
 }
 ```
 
