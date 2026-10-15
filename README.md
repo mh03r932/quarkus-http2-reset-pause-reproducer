@@ -145,15 +145,30 @@ and 130 times on `main`.
 mvn clean test -Dtest=ResetDuringMultipartDiagnostics -Dresteasy-reactive-vertx.version=3.40.1-trace
 ```
 
-| | worker-thread `resumeRequestInput()` calls | of those on a request that had already ended |
-| --- | --- | --- |
-| `main` snapshot, Vert.x 5.1.10 | 976 | 0 |
-| 3.40.1, Vert.x 4.5.34 | 944 | 26 |
+Three runs on each line, with the application counting the resets the server actually received:
 
-On 3.x each of those 26 would be an `IllegalStateException` without the guard. On `main` a reset no longer ends the
-request, so that path never saw an ended request. No exception slipped through the gap between the check and the
-`resume()` in any run, so the remaining race is real but I could not make it fire. Dispatching that one resume back
-onto the request's context closes it, and the 1 MB upload still completes:
+| | resets seen, of 25 | worker-thread `resumeRequestInput()` calls | of those already ended |
+| --- | --- | --- | --- |
+| `main` snapshot, Vert.x 5.1.10 | 19, 20, 20 | 1005, 1082, 859 | 0, 0, 0 |
+| 3.40.1, Vert.x 4.5.34 | 20, 17, 19 | 905, 955, 918 | 23, 28, 22 |
+
+On 3.x each of those would be an `IllegalStateException` without the guard. On `main` not one, in any run.
+
+`ResetWhilePausedDiagnostics` shows why, with no patched class involved:
+
+```sh
+mvn clean test -Dtest=ResetWhilePausedDiagnostics -Dobserve.resets=true
+```
+
+It cancels a paused request five times, and `ResetObserver` prints what the server makes of it. On 3.40.1 the
+request's exception handler gets a `StreamResetException` and `isEnded()` is already true, still true 400 ms later.
+On `main` the handler gets a `StreamResetException` and an `HttpClosedException` and `isEnded()` is false in all five
+rounds, flipping to true only later, once something downstream resumes the request and the end event queued behind
+the pause is delivered. By then the constructor has already paused it.
+
+No exception slipped through the gap between the check and the `resume()` in any run, so the remaining race is real
+but I could not make it fire. Dispatching that one resume back onto the request's context closes it, and the 1 MB
+upload still completes:
 
 ```java
 if (((ConnectionBase) request.connection()).channel().eventLoop().inEventLoop()) {
