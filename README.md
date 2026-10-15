@@ -6,25 +6,29 @@ Reproducer for the unguarded `request.pause()` in
 Upstream issue: [quarkusio/quarkus#34393](https://github.com/quarkusio/quarkus/issues/34393).
 Proposed fix: [quarkusio/quarkus#56595](https://github.com/quarkusio/quarkus/pull/56595).
 
-Over HTTP/2, `Http2ServerRequest.pause()` calls `checkEnded()` and throws once the request has ended, while the
-HTTP/1.1 implementation silently ignores it. The constructor of `VertxResteasyReactiveRequestContext` pauses the
-request unconditionally, so anything that makes a request end before Quarkus REST takes over turns into a 500 and an
-`ERROR` in the log.
+Over HTTP/2, `pause()` on the Vert.x server request calls `checkEnded()` and throws once the request has ended, while
+the HTTP/1.1 implementation ignores it. The constructor of `VertxResteasyReactiveRequestContext` pauses the request
+unconditionally, so anything that makes a request end before Quarkus REST takes over turns into a 500 and an `ERROR`
+in the log.
 
-## The two scenarios
+## The three scenarios
 
-`Http2StreamResetTest` — **a cancelled request**. `DelayingRouteFilter` defers `next()` by 500 ms for `/hello`,
+**`Http2StreamResetTest` — a cancelled request.** `DelayingRouteFilter` defers `next()` by 500 ms for `/hello`,
 standing in for any handler that runs before Quarkus REST without handing over straight away (a blocking filter,
 authentication, or the dev mode hot replacement scan). The client cancels after 100 ms, which sends `RST_STREAM`.
 `Http2ServerRequest.handleReset()` sets `ended = true` right away, even though the request is paused, and the
-`pause()` in the constructor then throws. This is what a browser does when it aborts an in-flight request, so in a
-dev mode app over TLS it shows up as unexplained `ERROR`s with an error id.
+`pause()` in the constructor then throws. This is what a browser does when it aborts an in-flight request, so in a dev
+mode app over TLS it shows up as unexplained `ERROR`s with an error id.
 
-`RouteHandoverTest` — **a reactive route handing over**, the scenario of #34393. `ForwardingRoute` sits on the path
-of `EchoResource` and calls `next()`. Its body handler has already read the request, so it has ended by the time
-Quarkus REST creates its context. The client gets a 500.
+**`RouteHandoverTest` — a reactive route handing over**, the scenario of #34393. `ForwardingRoute` sits on the path of
+`EchoResource` and calls `next()`. Its body handler has already read the request, so it has ended by the time Quarkus
+REST creates its context. The client gets a 500.
 
-In both cases HTTP/1.1 is fine; only HTTP/2 fails.
+**`FormParseTest` — a route that consumes the body itself.** `FormRoute` reads `/form` with its own
+`handler()`/`endHandler()`, so the request has ended *and* nothing is buffered in the routing context, and
+`FormResource` parses form data on the non-blocking path. This is the state that the `setReadListener()` branch of
+#56595 is about: `FormEncodedDataDefinition.parse()` registers a read listener on a request that has nothing left to
+deliver.
 
 ## Running it
 
@@ -36,20 +40,32 @@ mvn clean test -Dquarkus.platform.version=4.0.0.Beta1
 
 Use `clean` when switching versions: the test sources compile against the Vert.x version of the platform.
 
-The tests assert that the server logs nothing at `WARNING` or above, and print what it did log when they fail. HTTP/2
-is cleartext with prior knowledge, so no certificate is needed.
+The tests assert that the request is answered and that the server logs nothing at `WARNING` or above, and print what
+it did log when they fail. HTTP/2 is cleartext with prior knowledge, so no certificate is needed.
 
 ### What it does
 
-| Quarkus | Vert.x | cancelled HTTP/2 | cancelled HTTP/1.1 | handover HTTP/2 | handover HTTP/1.1 |
-| --- | --- | --- | --- | --- | --- |
-| 3.33.4 (LTS) | 4.5.34 | fails | ok | fails | ok |
-| 3.40.1 | 4.5.34 | fails | ok | fails | ok |
-| 4.0.0.Beta1 | 5.1.8 | ok | ok | fails | ok |
-| 3.33.4 / 3.40.1 with the #56595 guards | 4.5.34 | ok | ok | ok | ok |
+Seven tests, of which three fail on the 3.x line:
 
-The cancelled request stops failing on the Vert.x 5 line because `HttpServerRequestImpl.handleReset()` no longer sets
-`ended`; the handover scenario still fails there.
+| scenario | 3.33.4 / 3.40.1 (Vert.x 4.5.34) | 4.0.0.Beta1 (Vert.x 5.1.8) | 3.x with the #56595 guards |
+| --- | --- | --- | --- |
+| cancelled request, HTTP/2 | `ERROR`, no response | passes | passes |
+| cancelled request, HTTP/1.1 | passes | passes | passes |
+| route handover, HTTP/2 | 500 | 500 | passes |
+| route handover, HTTP/1.1 | passes | passes | passes |
+| route consumed the body, HTTP/2 | 500 | 500 | passes, empty form |
+| route consumed the body, HTTP/1.1 | no response at all, nothing logged | 500 | passes, empty form |
+| plain HTTP/2 request | passes | passes | passes |
+
+Two details behind the table:
+
+- The cancelled request stops failing on the Vert.x 5 line because `HttpServerRequestImpl.handleReset()` no longer
+  sets `ended` (checked in 5.1.8 and 5.1.10). The other two scenarios still fail there.
+- The HTTP/1.1 column is not a missing check but timing and bookkeeping. In Vert.x 4.5.34
+  `Http1xServerRequest.isEnded()` is `ended && (pending == null || (!pending.isPaused() && pending.isEmpty()))`, so
+  the `pause()` in `setReadListener()` makes `isEnded()` go back to `false`, the following `handler()` does not
+  complain, and the read simply never completes. In Vert.x 5 `Http1ServerRequest.isEnded()` is plain `ended`, so the
+  same path throws from `handler()` instead of hanging.
 
 ### Against the proposed fix
 
@@ -61,8 +77,13 @@ result as `<version>-guarded`, which avoids building Quarkus from source:
 mvn clean test -Dquarkus.platform.version=3.40.1 -Dresteasy-reactive-vertx.version=3.40.1-guarded
 ```
 
-All five tests pass, the resource method is reached, and nothing is logged: the write to the reset stream fails
-quietly.
+All seven tests pass, on 3.33.4 as well. The cancelled request reaches the resource method and nothing is logged: the
+write to the reset stream fails quietly. The form scenario answers with an empty form, which is all that is left of a
+request someone else has consumed.
+
+Replacing the early return of #56595 with a symmetric `if (!request.isEnded())` around the `pause()` in
+`setReadListener()` is not enough: both protocols then throw from the `request.handler()` call that follows, since
+that checks `ended` too.
 
 ### In prod mode
 
