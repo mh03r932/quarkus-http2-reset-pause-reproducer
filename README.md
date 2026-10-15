@@ -43,6 +43,10 @@ Use `clean` when switching versions: the test sources compile against the Vert.x
 The tests assert that the request is answered and that the server logs nothing at `WARNING` or above, and print what
 it did log when they fail. HTTP/2 is cleartext with prior knowledge, so no certificate is needed.
 
+The two `*Diagnostics` classes are not part of that run. They print evidence instead of asserting, they need the
+instrumented build from `./verify-fix.sh <version> trace`, and they are described further down. `/blocking` and
+`/multipart` exist only for them.
+
 ### What it does
 
 Seven tests, of which three fail on the 3.x line:
@@ -84,6 +88,46 @@ request someone else has consumed.
 Replacing the early return of #56595 with a symmetric `if (!request.isEnded())` around the `pause()` in
 `setReadListener()` is not enough: both protocols then throw from the `request.handler()` call that follows, since
 that checks `ended` too.
+
+### Which thread each call site runs on
+
+The review of #56595 asks whether the `isEnded()` checks are safe, since the check and the `pause()`/`resume()` are
+two separate operations under the Vert.x connection lock. That is only safe on the event loop that delivers the
+request's own events. `CallSiteThreadDiagnostics` prints where each site runs, for seven scenarios:
+
+```sh
+./verify-fix.sh 3.40.1 trace
+mvn clean test -Dtest=CallSiteThreadDiagnostics -Dresteasy-reactive-vertx.version=3.40.1-trace
+```
+
+| call site | thread |
+| --- | --- |
+| constructor | the connection's event loop, in all seven scenarios |
+| `pauseRequestInput()` | the connection's event loop |
+| `setReadListener()` | the connection's event loop |
+| `resumeRequestInput()` | the event loop, **except** from the non-blocking multipart parser, where it runs on `executor-thread-N` |
+
+The exception comes from `MultiPartParserDefinition.NonBlockingParseTask.data()`, which pauses on the event loop and
+then resumes from inside `executor.execute(...)`. A 1 MB non-blocking multipart upload does that 129 times.
+
+`ResetDuringMultipartDiagnostics` cancels 25 such uploads over HTTP/2 and counts what the guard catches:
+
+```sh
+mvn clean test -Dtest=ResetDuringMultipartDiagnostics -Dresteasy-reactive-vertx.version=3.40.1-trace
+```
+
+944 worker-thread calls to `resumeRequestInput()`, 26 of them on a request that had already ended, which without the
+guard would each have been an `IllegalStateException`. No exception slipped through the gap between the check and the
+`resume()` in those runs, so the remaining race is real but I could not make it fire. Dispatching that one resume
+back onto the request's context closes it, and the 1 MB upload still completes:
+
+```java
+if (((ConnectionBase) request.connection()).channel().eventLoop().inEventLoop()) {
+    resumeIfNotEnded();
+} else {
+    contextExecutor.execute(this::resumeIfNotEnded);
+}
+```
 
 ### In prod mode
 

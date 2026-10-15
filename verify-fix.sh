@@ -7,9 +7,20 @@
 #   ./verify-fix.sh 3.40.1
 #   mvn clean test -Dresteasy-reactive-vertx.version=3.40.1-guarded
 #
+# With "trace" as the second argument it also prints the thread each pause/resume call site runs on, and installs
+# that build as <version>-trace instead:
+#
+#   ./verify-fix.sh 3.40.1 trace
+#   mvn clean test -Dtest=CallSiteThreadTest -Dresteasy-reactive-vertx.version=3.40.1-trace
+#
 set -euo pipefail
 
 VERSION="${1:-3.40.1}"
+MODE="${2:-plain}"
+SUFFIX="guarded"
+if [ "${MODE}" = "trace" ]; then
+    SUFFIX="trace"
+fi
 BASE="https://repo1.maven.org/maven2/io/quarkus/resteasy/reactive/resteasy-reactive-vertx/${VERSION}"
 CLASS="org/jboss/resteasy/reactive/server/vertx/VertxResteasyReactiveRequestContext.java"
 WORK="$(mktemp -d)"
@@ -23,10 +34,11 @@ mkdir -p "${WORK}/src" "${WORK}/classes" "${WORK}/jar"
 unzip -qo "${WORK}/sources.jar" -d "${WORK}/src"
 
 echo "==> adding the isEnded() guards"
-python3 - "${WORK}/src/${CLASS}" <<'PY'
+python3 - "${WORK}/src/${CLASS}" "${MODE}" <<'PY'
 import sys, pathlib
 
 path = pathlib.Path(sys.argv[1])
+mode = sys.argv[2] if len(sys.argv) > 2 else "plain"
 source = path.read_text()
 edits = [
     # constructor
@@ -68,6 +80,47 @@ edits = [
         }
         request.pause();"""),
 ]
+if mode == "trace":
+    edits += [
+        ("""        };
+        if (!request.isEnded()) {""",
+         """        };
+        trace("constructor", request);
+        if (!request.isEnded()) {"""),
+        ("""    public ServerHttpResponse pauseRequestInput() {""",
+         """    public ServerHttpResponse pauseRequestInput() {
+        trace("pauseRequestInput", request);"""),
+        ("""        if (!request.isEnded()) {
+            request.resume();
+        }
+        return this;
+    }""",
+         """        trace("resumeRequestInput", request);
+        if (!request.isEnded()) {
+            request.resume();
+        }
+        return this;
+    }
+
+    private static void trace(String site, HttpServerRequest request) {
+        boolean connectionEventLoop;
+        try {
+            connectionEventLoop = ((ConnectionBase) request.connection()).channel().eventLoop().inEventLoop();
+        } catch (Throwable t) {
+            connectionEventLoop = false;
+        }
+        System.out.println("[site] " + site
+                + " thread=" + Thread.currentThread().getName()
+                + " onConnectionEventLoop=" + connectionEventLoop
+                + " onEventLoopThread=" + Context.isOnEventLoopThread()
+                + " vertxContext=" + (Vertx.currentContext() != null)
+                + " isEnded=" + request.isEnded());
+    }"""),
+        ("""    public ServerHttpResponse setReadListener(ReadCallback callback) {""",
+         """    public ServerHttpResponse setReadListener(ReadCallback callback) {
+        trace("setReadListener", request);"""),
+    ]
+
 for old, new in edits:
     if old not in source:
         sys.exit("pattern not found, the source of this version differs:\n" + old)
@@ -80,11 +133,11 @@ mvn -q -B dependency:build-classpath "-Dmdep.outputFile=${WORK}/cp.txt" -Dinclud
     "-Dquarkus.platform.version=${VERSION}" -Dresteasy-reactive-vertx.version="${VERSION}"
 javac -nowarn -proc:none -cp "$(cat "${WORK}/cp.txt")" -d "${WORK}/classes" "${WORK}/src/${CLASS}"
 
-echo "==> repackaging and installing ${VERSION}-guarded"
+echo "==> repackaging and installing ${VERSION}-${SUFFIX}"
 (cd "${WORK}/jar" && unzip -qo "${WORK}/orig.jar")
 cp "${WORK}/classes/$(dirname "${CLASS}")"/*.class "${WORK}/jar/$(dirname "${CLASS}")/"
 (cd "${WORK}/jar" && jar cf "${WORK}/guarded.jar" .)
-python3 - "${WORK}/orig.pom" "${VERSION}" <<'PY'
+python3 - "${WORK}/orig.pom" "${VERSION}-${SUFFIX}" <<'PY'
 import sys, pathlib
 
 path = pathlib.Path(sys.argv[1])
@@ -92,11 +145,11 @@ source = path.read_text()
 marker = "    <artifactId>resteasy-reactive-vertx</artifactId>\n"
 if marker not in source:
     sys.exit("unexpected pom layout")
-source = source.replace(marker, marker + "    <version>%s-guarded</version>\n" % sys.argv[2], 1)
+source = source.replace(marker, marker + "    <version>%s</version>\n" % sys.argv[2], 1)
 path.write_text(source)
 PY
 mvn -q -B install:install-file -Dfile="${WORK}/guarded.jar" -DpomFile="${WORK}/orig.pom"
 
 echo
-echo "installed io.quarkus.resteasy.reactive:resteasy-reactive-vertx:${VERSION}-guarded"
-echo "now run: mvn clean test -Dquarkus.platform.version=${VERSION} -Dresteasy-reactive-vertx.version=${VERSION}-guarded"
+echo "installed io.quarkus.resteasy.reactive:resteasy-reactive-vertx:${VERSION}-${SUFFIX}"
+echo "now run: mvn clean test -Dquarkus.platform.version=${VERSION} -Dresteasy-reactive-vertx.version=${VERSION}-${SUFFIX}"
