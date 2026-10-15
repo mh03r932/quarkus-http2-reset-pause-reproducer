@@ -61,6 +61,9 @@ Seven tests, of which three fail on the 3.x line:
 | route consumed the body, HTTP/1.1 | no response at all, nothing logged | 500 | passes, empty form |
 | plain HTTP/2 request | passes | passes | passes |
 
+The 2026-10-15 `main` snapshot behaves like 4.0.0.Beta1: the same three fail, and the PR's own file makes all seven
+pass. See below.
+
 Two details behind the table:
 
 - The cancelled request stops failing on the Vert.x 5 line because `HttpServerRequestImpl.handleReset()` no longer
@@ -89,11 +92,36 @@ Replacing the early return of #56595 with a symmetric `if (!request.isEnded())` 
 `setReadListener()` is not enough: both protocols then throw from the `request.handler()` call that follows, since
 that checks `ended` too.
 
+### Against main
+
+Releases are convenient, but the PR targets `main`, so this is the run that counts. Install the daily snapshot the
+way CONTRIBUTING.md describes, then point the reproducer at it:
+
+```sh
+curl -sL https://raw.githubusercontent.com/quarkusio/quarkus-ecosystem-ci/main/setup-quarkus | bash
+mvn -nsu clean test -Dquarkus.platform.group-id=io.quarkus -Dquarkus.platform.version=999-SNAPSHOT
+```
+
+On the 2026-10-15 snapshot (Quarkus 999-SNAPSHOT, Vert.x 5.1.10) three of the seven fail: the form scenario over
+both protocols and the handover over HTTP/2. The cancelled request passes, and the constructor sees `isEnded=false`
+there where 3.40.1 sees `true`, which is the Vert.x 5 reset behaviour measured rather than inferred.
+
+To run the PR's own code against that snapshot, take the file from the PR head, compile it against the snapshot
+classpath and install it under a version of its own, the same trick `verify-fix.sh` uses for releases:
+
+```sh
+git fetch origin pull/56595/head --depth=1
+git show FETCH_HEAD:independent-projects/resteasy-reactive/server/vertx/src/main/java/org/jboss/resteasy/reactive/server/vertx/VertxResteasyReactiveRequestContext.java
+```
+
+With that file compiled in, all seven pass.
+
 ### Which thread each call site runs on
 
 The review of #56595 asks whether the `isEnded()` checks are safe, since the check and the `pause()`/`resume()` are
 two separate operations under the Vert.x connection lock. That is only safe on the event loop that delivers the
-request's own events. `CallSiteThreadDiagnostics` prints where each site runs, for seven scenarios:
+request's own events. `CallSiteThreadDiagnostics` prints where each site runs, for seven scenarios. The table below
+came out the same on 3.40.1 and on the 2026-10-15 `main` snapshot with the file from the PR head compiled in:
 
 ```sh
 ./verify-fix.sh 3.40.1 trace
@@ -108,7 +136,8 @@ mvn clean test -Dtest=CallSiteThreadDiagnostics -Dresteasy-reactive-vertx.versio
 | `resumeRequestInput()` | the event loop, **except** from the non-blocking multipart parser, where it runs on `executor-thread-N` |
 
 The exception comes from `MultiPartParserDefinition.NonBlockingParseTask.data()`, which pauses on the event loop and
-then resumes from inside `executor.execute(...)`. A 1 MB non-blocking multipart upload does that 129 times.
+then resumes from inside `executor.execute(...)`. A 1 MB non-blocking multipart upload does that 129 times on 3.40.1
+and 130 times on `main`.
 
 `ResetDuringMultipartDiagnostics` cancels 25 such uploads over HTTP/2 and counts what the guard catches:
 
@@ -116,10 +145,15 @@ then resumes from inside `executor.execute(...)`. A 1 MB non-blocking multipart 
 mvn clean test -Dtest=ResetDuringMultipartDiagnostics -Dresteasy-reactive-vertx.version=3.40.1-trace
 ```
 
-944 worker-thread calls to `resumeRequestInput()`, 26 of them on a request that had already ended, which without the
-guard would each have been an `IllegalStateException`. No exception slipped through the gap between the check and the
-`resume()` in those runs, so the remaining race is real but I could not make it fire. Dispatching that one resume
-back onto the request's context closes it, and the 1 MB upload still completes:
+| | worker-thread `resumeRequestInput()` calls | of those on a request that had already ended |
+| --- | --- | --- |
+| `main` snapshot, Vert.x 5.1.10 | 976 | 0 |
+| 3.40.1, Vert.x 4.5.34 | 944 | 26 |
+
+On 3.x each of those 26 would be an `IllegalStateException` without the guard. On `main` a reset no longer ends the
+request, so that path never saw an ended request. No exception slipped through the gap between the check and the
+`resume()` in any run, so the remaining race is real but I could not make it fire. Dispatching that one resume back
+onto the request's context closes it, and the 1 MB upload still completes:
 
 ```java
 if (((ConnectionBase) request.connection()).channel().eventLoop().inEventLoop()) {
